@@ -25,6 +25,186 @@ class GifError(ValueError):
     """gifenc 的输入或编码错误；批量编码失败时整批抛这一个异常。"""
 
 
+# ---------------------------------------------------------------------------
+# 内部校验工具
+# ---------------------------------------------------------------------------
+
+def _is_int(value):
+    """真正的整数（排除 bool：True/False 不是颜色或延迟）。"""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _require_int(value, name):
+    if not _is_int(value):
+        raise GifError(f"{name} must be an integer")
+    return value
+
+
+def _require_positive_int(value, name):
+    if not _is_int(value) or value <= 0:
+        raise GifError(f"{name} must be a positive integer")
+    return value
+
+
+def _clamp(value):
+    """把一个整数分量钳制到 0..255（越界时钳制，绝不回绕）。"""
+    if value < 0:
+        return 0
+    if value > 255:
+        return 255
+    return value
+
+
+def _clamp_color(color):
+    """校验并返回钳制后的 ``(r, g, b)``。"""
+    if not isinstance(color, (tuple, list)) or len(color) != 3:
+        raise GifError(f"color must be an (r, g, b) triple, got {color!r}")
+    channels = []
+    for value in color:
+        if not _is_int(value):
+            raise GifError(f"color channel must be an integer, got {value!r}")
+        channels.append(_clamp(value))
+    return tuple(channels)
+
+
+def _is_valid_raw_color(color):
+    if not isinstance(color, (tuple, list)) or len(color) != 3:
+        return False
+    return all(_is_int(value) and 0 <= value <= 255 for value in color)
+
+
+def _normalize_frame(frame, name="frame"):
+    """把一帧转成钳制后的颜色平面，同时校验结构。"""
+    if not isinstance(frame, (tuple, list)) or len(frame) == 0:
+        raise GifError(f"{name} is empty or not a sequence of rows")
+    rows = []
+    for row in frame:
+        if not isinstance(row, (tuple, list)):
+            raise GifError(f"{name} contains a row that is not a sequence")
+        rows.append([_clamp_color(pixel) for pixel in row])
+    return rows
+
+
+def _normalize_palette(palette):
+    if not isinstance(palette, (tuple, list)):
+        raise GifError("palette must be a sequence of colors")
+    if not palette:
+        raise GifError("palette is empty")
+    if len(palette) > MAX_COLORS:
+        raise GifError("palette must contain at most 256 colors")
+    return [_clamp_color(color) for color in palette]
+
+
+def _nearest_index(color, palette):
+    """平方欧氏距离最近的颜色下标；距离相同时取较小下标。"""
+    best_index = 0
+    best_distance = None
+    for index, candidate in enumerate(palette):
+        dr = color[0] - candidate[0]
+        dg = color[1] - candidate[1]
+        db = color[2] - candidate[2]
+        distance = dr * dr + dg * dg + db * db
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            best_index = index
+    return best_index, palette[best_index]
+
+
+def _round_half_up(value):
+    return int(math.floor(value + 0.5))
+
+
+# ---------------------------------------------------------------------------
+# 比特流与 GIF 数据子块
+# ---------------------------------------------------------------------------
+
+class _BitWriter:
+    """LSB first 比特流写入器。"""
+
+    def __init__(self):
+        self._data = bytearray()
+        self._accumulator = 0
+        self._bits = 0
+
+    def write(self, code, width):
+        self._accumulator |= code << self._bits
+        self._bits += width
+        while self._bits >= 8:
+            self._data.append(self._accumulator & 0xFF)
+            self._accumulator >>= 8
+            self._bits -= 8
+
+    def finish(self):
+        if self._bits > 0:
+            self._data.append(self._accumulator & 0xFF)
+            self._accumulator = 0
+            self._bits = 0
+        return bytes(self._data)
+
+
+def _pack_subblocks(data):
+    """把裸字节流切成 GIF 数据子块，并以 0x00 结束。"""
+    chunks = bytearray()
+    for start in range(0, len(data), 255):
+        chunk = data[start:start + 255]
+        chunks.append(len(chunk))
+        chunks += chunk
+    chunks.append(0)
+    return bytes(chunks)
+
+
+# ---------------------------------------------------------------------------
+# 调色板生成
+# ---------------------------------------------------------------------------
+
+def _collect_pixels(frames):
+    """展平所有帧的有效像素（已钳制）。"""
+    if not isinstance(frames, (tuple, list)):
+        raise GifError("frames must be a sequence of frames")
+    pixels = []
+    for frame in frames:
+        for row in _normalize_frame(frame):
+            pixels.extend(row)
+    return pixels
+
+
+def _box_span(box):
+    """返回 (跨度最大的通道下标, 跨度)；单色盒子返回 (None, 0)。"""
+    low = [255, 255, 255]
+    high = [0, 0, 0]
+    for pixel in box:
+        for channel in range(3):
+            value = pixel[channel]
+            if value < low[channel]:
+                low[channel] = value
+            if value > high[channel]:
+                high[channel] = value
+    best_channel = None
+    best_span = 0
+    for channel in range(3):
+        span = high[channel] - low[channel]
+        if span > best_span:
+            best_span = span
+            best_channel = channel
+    return best_channel, best_span
+
+
+def _split_box(box, channel):
+    """按该通道的像素中位数把盒子一分为二（以像素计数，而非通道数）。"""
+    ordered = sorted(box, key=lambda pixel: pixel[channel])
+    middle = len(ordered) // 2
+    return ordered[:middle], ordered[middle:]
+
+
+def _box_average(box):
+    count = len(box)
+    channels = []
+    for channel in range(3):
+        total = sum(pixel[channel] for pixel in box)
+        channels.append(_clamp(_round_half_up(total / count)))
+    return tuple(channels)
+
+
 def median_cut(frames, max_colors):
     """用中位切分（median cut）从若干帧里生成全局调色板。
 
@@ -46,7 +226,44 @@ def median_cut(frames, max_colors):
         max_colors 不是 2..256 的整数、frames 为空或颜色不是三元组时抛
         ``GifError``（不允许除零或返回空调色板）。
     """
-    raise NotImplementedError("median_cut 尚未实现")
+    if not _is_int(max_colors) or not 2 <= max_colors <= MAX_COLORS:
+        raise GifError("max_colors must be an integer in 2..256")
+
+    pixels = _collect_pixels(frames)
+    if not pixels:
+        raise GifError("frames contain no pixels")
+
+    distinct = set(pixels)
+    if len(distinct) <= max_colors:
+        # 只返回真实出现过的颜色（单色图只得到 1 色），顺序按首次出现。
+        palette = []
+        seen = set()
+        for pixel in pixels:
+            if pixel not in seen:
+                seen.add(pixel)
+                palette.append(pixel)
+        return palette
+
+    boxes = [pixels]
+    while len(boxes) < max_colors:
+        # 挑“像素数最多”且还能继续切的盒子。
+        candidates = []
+        for index, box in enumerate(boxes):
+            if len(box) < 2:
+                continue
+            channel, span = _box_span(box)
+            if channel is None or span == 0:
+                continue
+            candidates.append((len(box), index, channel))
+        if not candidates:
+            break
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        _, chosen, channel = candidates[0]
+        left, right = _split_box(boxes[chosen], channel)
+        boxes[chosen:chosen + 1] = [left, right]
+
+    palette = [_box_average(box) for box in boxes if box]
+    return palette[:max_colors]
 
 
 def map_to_palette(frame, palette):
@@ -67,7 +284,9 @@ def map_to_palette(frame, palette):
     异常:
         frame/palette 为空、颜色不是三元组或调色板超过 256 色时抛 ``GifError``。
     """
-    raise NotImplementedError("map_to_palette 尚未实现")
+    colors = _normalize_palette(palette)
+    rows = _normalize_frame(frame)
+    return [[_nearest_index(pixel, colors)[0] for pixel in row] for row in rows]
 
 
 def dither(frame, palette, strength):
@@ -91,7 +310,50 @@ def dither(frame, palette, strength):
     “容差 1”指工作缓冲的浮点取整误差不得超过 1。
     强度越界、palette 为空或颜色非法时抛 ``GifError``。
     """
-    raise NotImplementedError("dither 尚未实现")
+    if isinstance(strength, bool) or not isinstance(strength, (int, float)):
+        raise GifError("strength must be a number in 0.0..1.0")
+    strength = float(strength)
+    if not math.isfinite(strength) or not 0.0 <= strength <= 1.0:
+        raise GifError("strength must be a number in 0.0..1.0")
+
+    colors = _normalize_palette(palette)
+    rows = _normalize_frame(frame)
+    height = len(rows)
+    width = max(len(row) for row in rows)
+
+    # 工作缓冲：用浮点保存每个像素的当前颜色，邻居可以是矩形之外的位置。
+    work = [[[float(value) for value in pixel] for pixel in row] for row in rows]
+    plane = [[0] * len(row) for row in rows]
+
+    for row in range(height):
+        for col in range(len(rows[row])):
+            current = tuple(work[row][col])
+            # 四舍五入到整数后仍钳制在 0..255，保证取色合法且误差不超过 1。
+            rounded = tuple(
+                _clamp(_round_half_up(value)) for value in current
+            )
+            index, chosen = _nearest_index(rounded, colors)
+            plane[row][col] = index
+            if strength == 0.0:
+                continue
+            error = [
+                (current[channel] - chosen[channel]) * strength
+                for channel in range(3)
+            ]
+
+            def spread(target_row, target_col, weight):
+                if 0 <= target_row < height:
+                    target = work[target_row]
+                    if 0 <= target_col < len(target):
+                        for channel in range(3):
+                            target[target_col][channel] += error[channel] * weight
+
+            spread(row, col + 1, 7.0 / 16.0)
+            spread(row + 1, col - 1, 3.0 / 16.0)
+            spread(row + 1, col, 5.0 / 16.0)
+            spread(row + 1, col + 1, 1.0 / 16.0)
+
+    return plane
 
 
 def quantize_delay(durations_ms):
@@ -108,7 +370,16 @@ def quantize_delay(durations_ms):
     异常:
         任一值不是正整数（0、负数、浮点、布尔等）时抛 ``GifError``。
     """
-    raise NotImplementedError("quantize_delay 尚未实现")
+    if not isinstance(durations_ms, (tuple, list)):
+        raise GifError("durations_ms must be a sequence of positive integers")
+    delays = []
+    for value in durations_ms:
+        if not _is_int(value) or value <= 0:
+            raise GifError(
+                f"duration must be a positive integer number of milliseconds, got {value!r}"
+            )
+        delays.append(max(MIN_DELAY_CS, -(-value // 10)))
+    return delays
 
 
 def lzw_encode(indices):
@@ -134,10 +405,67 @@ def lzw_encode(indices):
     异常:
         indices 含非整数或超出 0..255 时抛 ``GifError``。
     """
-    raise NotImplementedError("lzw_encode 尚未实现")
+    try:
+        iterator = iter(indices)
+    except TypeError:
+        raise GifError("indices must be an iterable of integers in 0..255")
+
+    values = []
+    for value in iterator:
+        if not _is_int(value) or not 0 <= value <= 255:
+            raise GifError(
+                f"index must be an integer in 0..255, got {value!r}"
+            )
+        values.append(value)
+    if not values:
+        raise GifError("indices must not be empty")
+
+    # 最小码宽由最大下标决定，GIF 规定最小为 2 位。
+    min_code_size = max(2, max(values).bit_length())
+    min_code_size = min(min_code_size, 8)
+    clear = 1 << min_code_size
+    end = clear + 1
+
+    writer = _BitWriter()
+    writer.write(clear, min_code_size + 1)
+
+    def fresh_table():
+        return {bytes([value]): value for value in range(clear)}
+
+    table = fresh_table()
+    next_code = end + 1
+    width = min_code_size + 1
+
+    current = bytes([values[0]])
+    for value in values[1:]:
+        candidate = current + bytes([value])
+        if candidate in table:
+            current = candidate
+            continue
+
+        writer.write(table[current], width)
+        if next_code < 4096:
+            table[candidate] = next_code
+            next_code += 1
+            # 编码端的字典比解码端领先一项，因此当下一个可用码超过 2**码宽
+            # 时加宽，才能与解码端“等于 2**码宽即加宽”保持同步。
+            if next_code > (1 << width) and width < 12:
+                width += 1
+        else:
+            # 字典已满（12 位），立即输出 clear 并重置，绝不出 13 位码。
+            writer.write(clear, width)
+            table = fresh_table()
+            next_code = end + 1
+            width = min_code_size + 1
+        current = bytes([value])
+
+    writer.write(table[current], width)
+    writer.write(end, width)
+
+    return bytes([min_code_size]) + _pack_subblocks(writer.finish())
 
 
-def assemble(planes, palette, width, height):
+def assemble(planes, palette, width, height, loop=0):
     """把若干索引平面拼装成最小合法 GIF89a 字节串。
 
     参数:
@@ -162,7 +490,67 @@ def assemble(planes, palette, width, height):
     异常:
         调色板/尺寸/平面不合法、索引超过调色板、delay_cs < 2 时抛 ``GifError``。
     """
-    raise NotImplementedError("assemble 尚未实现")
+    _require_positive_int(width, "width")
+    _require_positive_int(height, "height")
+    if not _is_int(loop) or loop < 0 or loop > 0xFFFF:
+        raise GifError("loop must be an integer in 0..65535")
+    colors = _normalize_palette(palette)
+    if not isinstance(planes, (tuple, list)) or not planes:
+        raise GifError("planes must be a non-empty sequence")
+
+    frames = []
+    for entry in planes:
+        if not isinstance(entry, (tuple, list)) or len(entry) != 2:
+            raise GifError("each plane entry must be an (indices, delay_cs) pair")
+        indices, delay_cs = entry
+        if not _is_int(delay_cs) or delay_cs < MIN_DELAY_CS:
+            raise GifError(f"delay_cs must be an integer >= {MIN_DELAY_CS}")
+        if not isinstance(indices, (tuple, list)) or len(indices) != height:
+            raise GifError(
+                f"plane must have exactly {height} rows, got "
+                f"{len(indices) if isinstance(indices, (tuple, list)) else 'non-sequence'}"
+            )
+        rows = []
+        for row in indices:
+            if not isinstance(row, (tuple, list)) or len(row) != width:
+                raise GifError(f"plane rows must have exactly {width} columns")
+            checked = []
+            for value in row:
+                if not _is_int(value) or not 0 <= value < len(colors):
+                    raise GifError(
+                        f"palette index must be an integer in 0..{len(colors) - 1}"
+                    )
+                checked.append(value)
+            rows.append(checked)
+        frames.append((rows, delay_cs))
+
+    # 全局颜色表补零到 2 的幂（至少 2 项，至多 256 项）。
+    table_size = 2
+    while table_size < len(colors):
+        table_size *= 2
+    size_field = table_size.bit_length() - 2  # 2 -> 0, 256 -> 7
+    packed = 0x80 | 0x70 | size_field
+
+    out = bytearray(b"GIF89a")
+    out += struct.pack("<HHBBB", width, height, packed, 0, 0)
+    for index in range(table_size):
+        color = colors[index] if index < len(colors) else (0, 0, 0)
+        out += bytes(color)
+
+    # NETSCAPE2.0 应用扩展：循环次数 0 表示无限循环。
+    out += b"\x21\xFF\x0BNETSCAPE2.0\x03\x01" + struct.pack("<H", loop) + b"\x00"
+
+    for rows, delay_cs in frames:
+        out += b"\x21\xF9\x04\x00"
+        out += struct.pack("<H", delay_cs)
+        out += b"\x00\x00"
+        out += b"\x2C"
+        out += struct.pack("<HHHHB", 0, 0, width, height, 0)
+        flattened = [value for row in rows for value in row]
+        out += lzw_encode(flattened)
+
+    out += b"\x3B"
+    return bytes(out)
 
 
 def validate_frames(frames, width, height):
@@ -186,7 +574,51 @@ def validate_frames(frames, width, height):
     异常:
         width/height 不是正整数时抛 ``GifError``。
     """
-    raise NotImplementedError("validate_frames 尚未实现")
+    _require_positive_int(width, "width")
+    _require_positive_int(height, "height")
+    if not isinstance(frames, (tuple, list)):
+        raise GifError("frames must be a sequence")
+
+    problems = []
+    for index, frame in enumerate(frames):
+        # 1) 空帧：没有行，或某行没有像素。
+        if not isinstance(frame, (tuple, list)) or len(frame) == 0:
+            problems.append(f"frame {index}: empty frame")
+            continue
+        is_empty = False
+        for row in frame:
+            if not isinstance(row, (tuple, list)) or len(row) == 0:
+                is_empty = True
+                break
+        if is_empty:
+            problems.append(f"frame {index}: empty frame")
+            continue
+
+        # 2) 尺寸：行数与每行列数都要精确匹配。
+        got_h = len(frame)
+        got_w = len(frame[0])
+        size_ok = got_h == height and all(
+            isinstance(row, (tuple, list)) and len(row) == width for row in frame
+        )
+        if not size_ok:
+            problems.append(
+                f"frame {index}: expected {width}x{height}, got {got_w}x{got_h}"
+            )
+            continue
+
+        # 3) 颜色分量 0..255，每帧最多报一条。
+        bad = None
+        for row_index, row in enumerate(frame):
+            for col_index, color in enumerate(row):
+                if not _is_valid_raw_color(color):
+                    bad = f"frame {index}: color out of range at ({row_index}, {col_index})"
+                    break
+            if bad is not None:
+                break
+        if bad is not None:
+            problems.append(bad)
+
+    return problems
 
 
 def encode_batch(animations, config):
@@ -227,4 +659,84 @@ def encode_batch(animations, config):
     异常:
         任一动画或 config 非法时抛 ``GifError``。
     """
-    raise NotImplementedError("encode_batch 尚未实现")
+    if not isinstance(config, dict):
+        raise GifError("config must be a dict")
+    max_colors = config.get("max_colors")
+    if not _is_int(max_colors) or not 2 <= max_colors <= MAX_COLORS:
+        raise GifError("config['max_colors'] must be an integer in 2..256")
+    dither_strength = config.get("dither", 0.0)
+    if isinstance(dither_strength, bool) or not isinstance(
+        dither_strength, (int, float)
+    ):
+        raise GifError("config['dither'] must be a number in 0.0..1.0")
+    dither_strength = float(dither_strength)
+    if not math.isfinite(dither_strength) or not 0.0 <= dither_strength <= 1.0:
+        raise GifError("config['dither'] must be a number in 0.0..1.0")
+    loop = config.get("loop", 0)
+    if not _is_int(loop) or loop < 0 or loop > 0xFFFF:
+        raise GifError("config['loop'] must be an integer in 0..65535")
+
+    if not isinstance(animations, (tuple, list)):
+        raise GifError("animations must be a sequence")
+
+    # 第一阶段：先对全部动画做校验，任一非法立即抛错，不产生部分结果。
+    prepared = []
+    for index, animation in enumerate(animations):
+        if not isinstance(animation, dict):
+            raise GifError(f"animation {index} must be a dict")
+        name = animation.get("name")
+        if not isinstance(name, str):
+            raise GifError(f"animation {index}: name must be a string")
+        width = animation.get("width")
+        height = animation.get("height")
+        _require_positive_int(width, "width")
+        _require_positive_int(height, "height")
+        frames = animation.get("frames")
+        if not isinstance(frames, (tuple, list)) or not frames:
+            raise GifError(f"animation {index}: frames must be a non-empty sequence")
+        problems = validate_frames(frames, width, height)
+        if problems:
+            raise GifError("; ".join(problems))
+        delays_ms = animation.get("durations_ms")
+        if not isinstance(delays_ms, (tuple, list)) or len(delays_ms) != len(frames):
+            raise GifError(
+                f"animation {index}: durations_ms must match the number of frames"
+            )
+        delays_cs = quantize_delay(delays_ms)
+        prepared.append(
+            {
+                "name": name,
+                "frames": frames,
+                "width": width,
+                "height": height,
+                "delays_cs": delays_cs,
+            }
+        )
+
+    # 第二阶段：全部合法后才真正编码；每个动画使用自己独立的调色板。
+    results = []
+    for item in prepared:
+        frames = item["frames"]
+        palette = median_cut(frames, max_colors)
+        planes = []
+        for frame, delay_cs in zip(frames, item["delays_cs"]):
+            if dither_strength > 0.0:
+                plane = dither(frame, palette, dither_strength)
+            else:
+                plane = map_to_palette(frame, palette)
+            planes.append((plane, delay_cs))
+        gif = assemble(planes, palette, item["width"], item["height"], loop)
+        results.append(
+            {
+                "name": item["name"],
+                "palette": palette,
+                "delays_cs": list(item["delays_cs"]),
+                "gif": gif,
+            }
+        )
+
+    return {
+        "count": len(results),
+        "total_bytes": sum(len(item["gif"]) for item in results),
+        "animations": results,
+    }
